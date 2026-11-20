@@ -1,0 +1,300 @@
+# Dograh — Dokploy deployment
+# =================================================================
+# Point a Dokploy "Compose" service at this file:
+#   Provider: GitHub  ·  Repo: DivineFlame/dograh  ·  Branch: main
+#   Compose Path: ./deploy/dokploy/docker-compose.yaml
+#
+# Based on deploy/hostinger (managed-Traefik variant), adapted to Dokploy:
+#   - Joins Dokploy's built-in Traefik via the external `dokploy-network`.
+#   - Routing + TLS are declared as Traefik labels here (kept in Git), so do
+#     NOT also add a domain for the same host in Dokploy's "Domains" tab.
+#     Routes:  /api/v1 (+ signaling WebSocket) -> api:8000
+#              /voice-audio                    -> minio:9000
+#              everything else                 -> ui:3010
+#     Each route gets an HTTPS router (Let's Encrypt) and an HTTP router that
+#     redirects to HTTPS via Dokploy's `redirect-to-https@file` middleware.
+#   - No container_name anywhere (Dokploy prefixes container names per app;
+#     fixed names break redeploys, logs and monitoring).
+#   - Web tier publishes no host ports. Only coturn binds host ports, because
+#     WebRTC media is UDP and cannot go through Traefik.
+#   - Env vars come from Dokploy's "Environment" tab, which Dokploy writes to
+#     a .env next to this file for ${VAR} interpolation. See .env.example.
+# =================================================================
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      # Baked into the volume on first init; changing it later does NOT
+      # re-key an existing database.
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+      POSTGRES_DB: postgres
+    logging: *default-logging
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: >
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    logging: *default-logging
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+    networks:
+      - app-network
+
+  minio:
+    # Community MinIO fork built by github.com/dograh-hq/minio.
+    image: ${REGISTRY:-dograhai}/minio:2026.09.22
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}"
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
+    logging: *default-logging
+    # No host ports. Browsers fetch audio via Traefik at
+    # https://${PUBLIC_HOST}/voice-audio/... For the admin console, SSH
+    # port-forward to the container's 9001 instead of publishing it.
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.services.${ROUTER_PREFIX:-dograh}-audio.loadbalancer.server.port=9000"
+      # HTTPS
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/voice-audio`)"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio.entrypoints=websecure"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio.tls=true"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio.priority=20"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio.service=${ROUTER_PREFIX:-dograh}-audio"
+      # HTTP -> HTTPS
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio-http.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/voice-audio`)"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio-http.entrypoints=web"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio-http.middlewares=redirect-to-https@file"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio-http.priority=20"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-audio-http.service=${ROUTER_PREFIX:-dograh}-audio"
+    networks:
+      - app-network
+      - dokploy-network
+
+  # TURN/STUN relay — the voice media path. UDP, NOT proxied by Traefik.
+  # These host ports must be open in the server firewall, and TURN_HOST must be
+  # the server's public IP. Without it calls connect but carry NO audio.
+  # Configured entirely from CLI flags (-n = no config file), so nothing
+  # outside this compose file is needed.
+  coturn:
+    image: coturn/coturn:4.8.0
+    restart: unless-stopped
+    command:
+      - -n
+      - "--listening-port=3478"
+      - "--tls-listening-port=5349"
+      - "--min-port=49152"
+      - "--max-port=49200"
+      - "--external-ip=${TURN_HOST:?TURN_HOST is required}"
+      - "--realm=${TURN_REALM:-dograh.com}"
+      - --use-auth-secret
+      - "--static-auth-secret=${TURN_SECRET:?TURN_SECRET is required}"
+      - --fingerprint
+      - --no-cli
+      - --no-multicast-peers
+      - "--log-file=stdout"
+    logging: *default-logging
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/udp"
+      - "5349:5349/tcp"
+      - "49152-49200:49152-49200/udp"
+    networks:
+      - app-network
+
+  api:
+    image: ${REGISTRY:-dograhai}/dograh-api:${DOGRAH_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      # production => drops private-IP ICE candidates and orders TURN UDP-first.
+      ENVIRONMENT: "production"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      ENABLE_SIGNUP: "${ENABLE_SIGNUP:-true}"
+
+      # Public HTTPS origin (TLS terminated by Dokploy's Traefik).
+      PUBLIC_HOST: "${PUBLIC_HOST:?PUBLIC_HOST is required}"
+      PUBLIC_BASE_URL: "https://${PUBLIC_HOST}"
+      BACKEND_API_ENDPOINT: "https://${PUBLIC_HOST}"
+
+      DATABASE_URL: "postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
+
+      # Storage — bundled MinIO by default; set ENABLE_AWS_S3=true + the S3_*
+      # vars to use AWS S3 or another S3-compatible store instead.
+      ENABLE_AWS_S3: "${ENABLE_AWS_S3:-false}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      S3_BUCKET: "${S3_BUCKET:-}"
+      S3_REGION: "${S3_REGION:-us-east-1}"
+      S3_ENDPOINT_URL: "${S3_ENDPOINT_URL:-}"
+      S3_SIGNATURE_VERSION: "${S3_SIGNATURE_VERSION:-}"
+      S3_ADDRESSING_STYLE: "${S3_ADDRESSING_STYLE:-}"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_PUBLIC_ENDPOINT: "https://${PUBLIC_HOST}"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+      MINIO_BUCKET: "voice-audio"
+      MINIO_SECURE: "false"
+
+      # Pinned to 1: the image starts FASTAPI_WORKERS uvicorn processes on
+      # consecutive ports for the bundled nginx to balance; Traefik labels target
+      # one port, and the container also runs singletons (ARI manager, campaign
+      # orchestrator, migrations). Scale the server vertically instead.
+      FASTAPI_WORKERS: "1"
+      ENABLE_ARI_MANAGER: "${ENABLE_ARI_MANAGER:-true}"
+      ENABLE_CAMPAIGN_ORCHESTRATOR: "${ENABLE_CAMPAIGN_ORCHESTRATOR:-true}"
+
+      # Trust Traefik's X-Forwarded-Proto so request.url is https and inbound
+      # telephony webhook signature checks pass.
+      FORWARDED_ALLOW_IPS: "*"
+
+      ENABLE_COTURN: "true"
+      TURN_HOST: "${TURN_HOST}"
+      TURN_SECRET: "${TURN_SECRET}"
+      FORCE_TURN_RELAY: "${FORCE_TURN_RELAY:-false}"
+
+      OSS_JWT_SECRET: "${OSS_JWT_SECRET:?OSS_JWT_SECRET must be set to a strong secret}"
+
+      TELEPHONY_WS_TOKEN_SECRET: "${TELEPHONY_WS_TOKEN_SECRET:-}"
+      TELEPHONY_WS_TOKEN_ENFORCE: "${TELEPHONY_WS_TOKEN_ENFORCE:-false}"
+
+      ENABLE_PROMETHEUS_METRICS: "${ENABLE_PROMETHEUS_METRICS:-false}"
+      DOGRAH_DEVOPS_SECRET: "${DOGRAH_DEVOPS_SECRET:-}"
+      LANGFUSE_TRACES_PUBLIC: "${LANGFUSE_TRACES_PUBLIC:-false}"
+
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-true}"
+      POSTHOG_API_KEY: "phc_ItizB1dP6yv7ZYobbcqrpxTdbomDA8hJFSEmAMdYvIr"
+      POSTHOG_HOST: "https://us.i.posthog.com"
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'python -c "import urllib.request; urllib.request.urlopen(''http://localhost:8000/api/v1/health'').read()"',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.services.${ROUTER_PREFIX:-dograh}-api.loadbalancer.server.port=8000"
+      # HTTPS — REST API + signaling WebSocket (/api/v1/ws/...). Traefik
+      # upgrades WebSockets automatically.
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/api/v1`)"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api.entrypoints=websecure"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api.tls=true"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api.priority=10"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api.service=${ROUTER_PREFIX:-dograh}-api"
+      # HTTP -> HTTPS
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api-http.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/api/v1`)"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api-http.entrypoints=web"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api-http.middlewares=redirect-to-https@file"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api-http.priority=10"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-api-http.service=${ROUTER_PREFIX:-dograh}-api"
+    networks:
+      - app-network
+      - dokploy-network
+
+  ui:
+    image: ${REGISTRY:-dograhai}/dograh-ui:${DOGRAH_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      HOSTNAME: "0.0.0.0"
+      # Server-side (SSR) calls stay on the internal Docker network.
+      BACKEND_URL: "http://api:8000"
+      NODE_ENV: "oss"
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-true}"
+      POSTHOG_KEY: "phc_ItizB1dP6yv7ZYobbcqrpxTdbomDA8hJFSEmAMdYvIr"
+      POSTHOG_HOST: "https://us.posthog.com"
+    logging: *default-logging
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://127.0.0.1:3010 || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.services.${ROUTER_PREFIX:-dograh}-ui.loadbalancer.server.port=3010"
+      # HTTPS — catch-all for everything not matched above.
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui.rule=Host(`${PUBLIC_HOST}`)"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui.entrypoints=websecure"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui.tls=true"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui.priority=1"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui.service=${ROUTER_PREFIX:-dograh}-ui"
+      # HTTP -> HTTPS
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui-http.rule=Host(`${PUBLIC_HOST}`)"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui-http.entrypoints=web"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui-http.middlewares=redirect-to-https@file"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui-http.priority=1"
+      - "traefik.http.routers.${ROUTER_PREFIX:-dograh}-ui-http.service=${ROUTER_PREFIX:-dograh}-ui"
+    networks:
+      - app-network
+      - dokploy-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio-data:
+
+networks:
+  # Internal service-to-service network (db, redis, minio, coturn).
+  app-network:
+    driver: bridge
+  # Dokploy's Traefik network — created by Dokploy, must not be redefined.
+  dokploy-network:
+    external: true
